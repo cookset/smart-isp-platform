@@ -1,0 +1,391 @@
+version: '3.8'
+
+networks:
+  isp_external:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.0.0/16
+  isp_backend_admin:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  isp_tailscale:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+volumes:
+  mysql_master_data:
+  mysql_slave_data:
+  redis_data:
+  grafana_data:
+  prometheus_data:
+  pihole_data:
+  openwrt_data:
+  mikrotik_data:
+  nginx_certs:
+  backup_data:
+  ai_models:
+
+services:
+  # === Network Services ===
+  openwrt:
+    image: openwrt/rootfs:latest
+    container_name: isp_openwrt
+    privileged: true
+    networks:
+      isp_external:
+        ipv4_address: 192.168.1.1
+      isp_backend_admin:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - openwrt_data:/overlay
+    environment:
+      - TZ=Africa/Cairo
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ping", "-c", "1", "8.8.8.8"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mikrotik:
+    image: evilfreelancer/docker-routeros:latest
+    container_name: isp_mikrotik
+    privileged: true
+    networks:
+      isp_external:
+        ipv4_address: 192.168.1.2
+      isp_backend_admin:
+        ipv4_address: 172.30.0.11
+    ports:
+      - "8728:8728"  # API
+      - "8291:8291"  # Winbox
+    volumes:
+      - mikrotik_data:/data
+    environment:
+      - TZ=Africa/Cairo
+    restart: unless-stopped
+
+  pihole:
+    image: pihole/pihole:latest
+    container_name: isp_pihole
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.12
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "8053:80/tcp"
+    volumes:
+      - pihole_data:/etc/pihole
+    environment:
+      - TZ=Africa/Cairo
+      - WEBPASSWORD=admin123
+      - SERVERIP=172.30.0.12
+    restart: unless-stopped
+    dns:
+      - 127.0.0.1
+      - 8.8.8.8
+
+  # === Database Services ===
+  mysql_master:
+    image: mysql:8.0
+    container_name: isp_mysql_master
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.20
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_master_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      - MYSQL_ROOT_PASSWORD=secure_password_2026
+      - MYSQL_DATABASE=isp_management
+      - MYSQL_USER=isp_user
+      - MYSQL_PASSWORD=isp_secure_pass
+      - TZ=Africa/Cairo
+    command: >
+      --server-id=1
+      --log-bin=mysql-bin
+      --binlog-do-db=isp_management
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  mysql_slave:
+    image: mysql:8.0
+    container_name: isp_mysql_slave
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.21
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_slave_data:/var/lib/mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=secure_password_2026
+      - TZ=Africa/Cairo
+    command: >
+      --server-id=2
+      --relay-log=mysql-relay
+      --read-only=1
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    depends_on:
+      - mysql_master
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: isp_redis
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.22
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --requirepass redis_secure_pass
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # === AI Service ===
+  llamacpp-gpu:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    container_name: isp_ai_llama
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.30
+    ports:
+      - "8080:8080"
+    volumes:
+      - ai_models:/models
+    environment:
+      - MODEL=/models/gpt-oss-20b-q4_k_m.gguf
+      - N_GPU_LAYERS=35
+      - CONTEXT_SIZE=4096
+      - BATCH_SIZE=512
+      - TZ=Africa/Cairo
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # === Backend API ===
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: isp_backend_api
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.40
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - DB_HOST=172.30.0.20
+      - DB_PORT=3306
+      - DB_USER=isp_user
+      - DB_PASSWORD=isp_secure_pass
+      - DB_NAME=isp_management
+      - REDIS_HOST=172.30.0.22
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis_secure_pass
+      - AI_API_URL=http://172.30.0.30:8080
+      - MIKROTIK_HOST=172.30.0.11
+      - MIKROTIK_USER=admin
+      - MIKROTIK_PASSWORD=admin
+      - JWT_SECRET=your_jwt_secret_key_2026_secure
+      - TZ=Africa/Cairo
+    depends_on:
+      - mysql_master
+      - redis
+      - llamacpp-gpu
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # === Monitoring Services ===
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: isp_prometheus
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.50
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: isp_grafana
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.51
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+      - TZ=Africa/Cairo
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: isp_node_exporter
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.52
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: isp_alertmanager
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.53
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+    restart: unless-stopped
+
+  # === Reverse Proxy & Security ===
+  nginx:
+    image: nginx:alpine
+    container_name: isp_nginx
+    networks:
+      isp_external:
+        ipv4_address: 192.168.1.100
+      isp_backend_admin:
+        ipv4_address: 172.30.0.60
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - nginx_certs:/etc/nginx/certs
+    depends_on:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: isp_tailscale
+    privileged: true
+    networks:
+      isp_tailscale:
+        ipv4_address: 172.31.0.10
+      isp_backend_admin:
+        ipv4_address: 172.30.0.61
+    volumes:
+      - /var/lib:/var/lib
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+    restart: unless-stopped
+
+  # === Automation Services ===
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: isp_watchtower
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.70
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_SCHEDULE=0 0 2 * * *  # 2 AM daily
+      - TZ=Africa/Cairo
+    restart: unless-stopped
+
+  backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile
+    container_name: isp_backup
+    networks:
+      isp_backend_admin:
+        ipv4_address: 172.30.0.71
+    volumes:
+      - mysql_master_data:/backup/mysql:ro
+      - redis_data:/backup/redis:ro
+      - backup_data:/backup/archive
+      - ./backup/scripts:/scripts
+    environment:
+      - BACKUP_SCHEDULE=0 3 * * *  # 3 AM daily
+      - RETENTION_DAYS=30
+      - GOOGLE_DRIVE_ENABLED=true
+      - S3_ENABLED=false
+      - TZ=Africa/Cairo
+    restart: unless-stopped
